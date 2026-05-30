@@ -1,0 +1,1 @@
+﻿Write a Python script that calculates prime numbers up to 100 and saves them to a file called primes100.py in D:\LocalAI\PythonProject.

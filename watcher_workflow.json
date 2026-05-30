@@ -1,0 +1,60 @@
+﻿{
+  "name": "Autonomous Project Trigger",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "D:\\LocalAI\\inbox",
+        "events": ["fileCreated"]
+      },
+      "name": "Watch Inbox",
+      "type": "n8n-nodes-base.localFileTrigger",
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "filePath": "={{ $json.filePath }}",
+        "encoding": "utf8"
+      },
+      "name": "Read File",
+      "type": "n8n-nodes-base.readFile",
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "values": {
+          "string": [
+            {
+              "name": "goal",
+              "value": "={{ $json.data }}"
+            }
+          ]
+        }
+      },
+      "name": "Set Goal",
+      "type": "n8n-nodes-base.set",
+      "position": [650, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://172.24.112.1:8000/run_project",
+        "sendBody": true,
+        "bodyContentType": "json",
+        "body": "{\n  \"goal\": \"{{ $json.goal }}\",\n  \"max_tasks\": 5\n}",
+        "options": {
+          "timeout": 900000,
+          "responseFormat": "json",
+          "stream": false
+        }
+      },
+      "name": "Execute Brain Project",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [850, 300]
+    }
+  ],
+  "connections": {
+    "Watch Inbox": { "main": [[ { "node": "Read File", "type": "main", "index": 0 } ]] },
+    "Read File": { "main": [[ { "node": "Set Goal", "type": "main", "index": 0 } ]] },
+    "Set Goal": { "main": [[ { "node": "Execute Brain Project", "type": "main", "index": 0 } ]] }
+  }
+}

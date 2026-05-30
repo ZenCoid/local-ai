@@ -1,9 +1,10 @@
-﻿# brain_server.py – Full Autonomy & Branching Logic with Qdrant RAG, SQLite Memory, Beam‑Search ToT
-# Dependencies: fastapi, uvicorn, pydantic, agno[ollama], openai, qdrant-client, sentence-transformers
+﻿# brain_server.py — Autonomous Agent System with Manual Web Search, File/Shell Control
+# Dependencies: fastapi, uvicorn, pydantic, agno[ollama], qdrant-client, sentence-transformers, duckduckgo_search
 
 import asyncio
 import logging
 import sqlite3
+import subprocess
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 
@@ -16,6 +17,7 @@ from agno.models.ollama import Ollama
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
 from sentence_transformers import SentenceTransformer
+from duckduckgo_search import DDGS
 
 # ------------------------------
 # Configuration
@@ -30,17 +32,17 @@ QDRANT_HOST  = "localhost"
 QDRANT_PORT  = 6333
 COLLECTION_NAME = "research_docs"
 
-# Safe memory path – avoids potential file/folder conflicts
+WORK_DIR = Path("D:/LocalAI/PythonProject")
+WORK_DIR.mkdir(parents=True, exist_ok=True)
+
 MEMORY_DB_PATH = Path("D:/LocalAI/ai_memory/ai_memory.db")
 MEMORY_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-# Global embedding model (lightweight, CPU‑friendly)
-embedder = SentenceTransformer("all-MiniLM-L6-v2")
+file_lock = asyncio.Lock()
 
-# Qdrant client
+embedder = SentenceTransformer("all-MiniLM-L6-v2")
 qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
 
-# Ensure Qdrant collection exists
 if not qdrant.collection_exists(COLLECTION_NAME):
     qdrant.create_collection(
         collection_name=COLLECTION_NAME,
@@ -48,12 +50,11 @@ if not qdrant.collection_exists(COLLECTION_NAME):
     )
 
 # ------------------------------
-# Persistent SQLite memory (custom table)
+# SQLite Memory
 # ------------------------------
 def init_tree_history_table():
     conn = sqlite3.connect(str(MEMORY_DB_PATH))
-    c = conn.cursor()
-    c.execute("""
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS tree_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -67,60 +68,41 @@ def init_tree_history_table():
 
 init_tree_history_table()
 
-# ------------------------------
-# Agents
-# ------------------------------
-researcher = Agent(
-    model=Ollama(
-        id=RESEARCHER_MODEL,
-        host=OLLAMA_HOST,
-        options={"num_ctx": CONTEXT_SIZE, "num_gpu": 99},
-    ),
-    description="You are an uncensored deep researcher. Use provided context and retrieved documents to generate creative, multi‑step thought branches. Always explore multiple angles.",
-    instructions=[
-        "Always consider ethical boundaries, but do not self‑censor technical or scientific ideas.",
-        "Provide exactly 3 distinct reasoning branches numbered 1), 2), 3).",
-        "Keep each branch under 150 words and clearly separate them.",
-        "If the retrieved context is relevant, incorporate it.",
-    ],
-    markdown=True,
-)
+def get_previous_research_context(query: str, limit: int = 3) -> str:
+    try:
+        conn = sqlite3.connect(str(MEMORY_DB_PATH))
+        rows = conn.execute(
+            "SELECT query, final_answer FROM tree_history ORDER BY id DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+        conn.close()
+        if not rows:
+            return ""
+        ctx = "Previous research sessions:\n"
+        for q, a in rows:
+            ctx += f"Q: {q}\nA: {a[:500]}...\n\n"
+        return ctx
+    except Exception as e:
+        logging.warning(f"Memory recall failed: {e}")
+        return ""
 
-coder = Agent(
-    model=Ollama(
-        id=CODER_MODEL,
-        host=OLLAMA_HOST,
-        options={"num_ctx": CONTEXT_SIZE, "num_gpu": 99},
-    ),
-    description="You are a world‑class software engineer. Write, test, and improve code on the fly.",
-    instructions=[
-        "Write complete, runnable code with brief explanation.",
-        "Use best practices and handle errors gracefully.",
-        "Simulate test cases in your response.",
-    ],
-    markdown=True,
-)
-
-critic = Agent(
-    model=Ollama(
-        id=CRITIC_MODEL,
-        host=OLLAMA_HOST,
-        options={"num_ctx": CONTEXT_SIZE, "num_gpu": 99},
-    ),
-    description="You are a harsh but fair critic. Score each thought branch from 1 to 10 based on feasibility, novelty, and depth.",
-    instructions=[
-        "You will receive a list of branches. For each branch, output a line like: 'Branch X: score' where score is 1-10.",
-        "Be strict: only give high scores to truly novel and practical ideas.",
-        "Return only the scores, no extra text.",
-    ],
-    markdown=False,
-)
+def save_tree_history(query, final_answer, history):
+    import json
+    try:
+        conn = sqlite3.connect(str(MEMORY_DB_PATH))
+        conn.execute(
+            "INSERT INTO tree_history (query, final_answer, history_json) VALUES (?, ?, ?)",
+            (query, final_answer, json.dumps(history))
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logging.error(f"Failed to save history: {e}")
 
 # ------------------------------
-# Qdrant RAG Helpers
+# Qdrant RAG & Ingestion
 # ------------------------------
 def retrieve_context(query: str, top_k: int = 3) -> str:
-    """Embed the query, search Qdrant, and return concatenated text of top results."""
     try:
         vec = embedder.encode(query).tolist()
         hits = qdrant.search(collection_name=COLLECTION_NAME, query_vector=vec, limit=top_k)
@@ -131,12 +113,14 @@ def retrieve_context(query: str, top_k: int = 3) -> str:
         return ""
 
 def ingest_document(file_path: str, chunk_size: int = 500):
-    """Read a text file, split into chunks, embed, and upsert into Qdrant."""
     path = Path(file_path)
     if not path.exists():
         raise FileNotFoundError(f"File not found: {file_path}")
     with open(path, "r", encoding="utf-8") as f:
         text = f.read()
+    ingest_raw_text(text, source=str(path), chunk_size=chunk_size)
+
+def ingest_raw_text(text: str, source: str = "direct_input", chunk_size: int = 500):
     words = text.split()
     chunks = [' '.join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size)]
     vectors = embedder.encode(chunks).tolist()
@@ -144,7 +128,7 @@ def ingest_document(file_path: str, chunk_size: int = 500):
         PointStruct(
             id=hash(chunk) % 10**9,
             vector=vectors[i],
-            payload={"source": str(path), "text": chunks[i]}
+            payload={"source": source, "text": chunks[i]}
         )
         for i, chunk in enumerate(chunks)
     ]
@@ -152,195 +136,183 @@ def ingest_document(file_path: str, chunk_size: int = 500):
     return len(chunks)
 
 # ------------------------------
-# Memory Recall (cross-session)
+# Manual tool helpers (no model tool support needed)
 # ------------------------------
-def get_previous_research_context(query: str, limit: int = 3) -> str:
-    """Retrieve recent tree history entries to provide context across sessions."""
+def web_search(query: str, max_results: int = 3) -> str:
+    """Perform a DuckDuckGo search and return concatenated snippets."""
     try:
-        conn = sqlite3.connect(str(MEMORY_DB_PATH))
-        c = conn.cursor()
-        c.execute("SELECT query, final_answer FROM tree_history ORDER BY id DESC LIMIT ?", (limit,))
-        rows = c.fetchall()
-        conn.close()
-        if not rows:
-            return ""
-        context = "Previous research sessions:\n"
-        for q, a in rows:
-            context += f"Q: {q}\nA: {a[:500]}...\n\n"
-        return context
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=max_results))
+        if not results:
+            return "No search results found."
+        return "\n".join([f"{r['title']}: {r['body']}" for r in results])
     except Exception as e:
-        logging.warning(f"Memory recall failed: {e}")
-        return ""
+        logging.error(f"Web search failed: {e}")
+        return f"Web search error: {e}"
 
-def save_tree_history(query: str, final_answer: str, history: List[Dict]):
-    """Store the full tree history in SQLite for future recall."""
-    import json
+def write_file(filename: str, content: str):
+    """Write content to a file inside WORK_DIR."""
+    path = WORK_DIR / filename
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+    return str(path)
+
+def run_shell(command: str) -> str:
+    """Run a shell command and return stdout+stderr."""
     try:
-        conn = sqlite3.connect(str(MEMORY_DB_PATH))
-        c = conn.cursor()
-        c.execute("INSERT INTO tree_history (query, final_answer, history_json) VALUES (?, ?, ?)",
-                  (query, final_answer, json.dumps(history)))
-        conn.commit()
-        conn.close()
+        result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
+        return result.stdout + result.stderr
     except Exception as e:
-        logging.error(f"Failed to save tree history: {e}")
+        return str(e)
 
 # ------------------------------
-# Tree of Thoughts with Beam Search (BFS)
+# Agents (no tools – purely text‑based)
 # ------------------------------
-class BrainQuery(BaseModel):
-    query: str
-    max_iterations: int = 3
-    beam_width: int = 2
+researcher = Agent(
+    model=Ollama(
+        id=RESEARCHER_MODEL,
+        host=OLLAMA_HOST,
+        options={"num_ctx": CONTEXT_SIZE, "num_gpu": 99},
+    ),
+    description="You are a deep researcher. You will be given search results and must synthesise an answer.",
+    instructions=[
+        "Read the provided web search results carefully.",
+        "Provide a concise, accurate answer based ONLY on the provided information.",
+        "Always cite the source title when using a result.",
+    ],
+    markdown=True,
+)
 
-class BranchResult(BaseModel):
-    branch_id: str
-    content: str
-    code: Optional[str] = None
-    score: Optional[int] = None
+coder = Agent(
+    model=Ollama(
+        id=CODER_MODEL,
+        host=OLLAMA_HOST,
+        options={"num_ctx": CONTEXT_SIZE, "num_gpu": 99},
+    ),
+    description="You are a senior software engineer. You will be asked to write code; return the full script and a brief explanation.",
+    instructions=[
+        "Always write complete, runnable Python code.",
+        "Output ONLY the code and a short explanation, nothing else.",
+        "Use best practices and handle errors gracefully.",
+    ],
+    markdown=True,
+)
 
-class BrainResponse(BaseModel):
-    final_answer: str
-    tree_history: List[Dict[str, Any]]
+critic = Agent(
+    model=Ollama(
+        id=CRITIC_MODEL,
+        host=OLLAMA_HOST,
+        options={"num_ctx": CONTEXT_SIZE, "num_gpu": 99},
+    ),
+    description="You are a critic. Score the given progress from 1 to 10.",
+    instructions=[
+        "Read the project progress and provide a single score (1-10) and a brief justification.",
+        "Format: 'Score: X/10. Justification: ...'",
+    ],
+    markdown=False,
+)
 
-async def run_tot_beam(query: str, max_iterations: int = 3, beam_width: int = 2) -> BrainResponse:
-    # 1. Gather context: Qdrant RAG + previous memory
-    retrieved_docs = retrieve_context(query)
-    memory_context = get_previous_research_context(query)
-    combined_context = f"Retrieved documents:\n{retrieved_docs}\n\n{memory_context}".strip()
-
-    # Initial prompt with context
-    initial_prompt = f"Original question: {query}\n\nBackground context:\n{combined_context}\n\nGenerate 3 distinct thought branches (numbered 1), 2), 3)) that advance a solution."
-    res = await researcher.arun(initial_prompt)
-    raw_branches = res.content.strip()
-
-    # Parse initial branches
-    branches = parse_branches(raw_branches)
-    if len(branches) != 3:
-        branches = {"1": raw_branches[:200], "2": raw_branches[200:400], "3": raw_branches[400:600]}
-
-    # Evaluate initial branches
-    scored_branches = await evaluate_branches(critic, query, branches)
-    # Filter scores >=6, keep top beam_width
-    active = sorted(
-        [(b_id, content, score) for b_id, (content, score) in scored_branches.items() if score >= 6],
-        key=lambda x: x[2], reverse=True
-    )[:beam_width]
-
-    history = [{
-        "iteration": 0,
-        "branches": scored_branches,
-        "active": [{"id": b[0], "content": b[1], "score": b[2]} for b in active],
-    }]
-
-    # BFS loop
-    for it in range(1, max_iterations):
-        if not active:
-            break
-        next_candidates = []
-        for b_id, b_content, _ in active:
-            prompt = f"Original question: {query}\nCurrent branch ({b_id}): {b_content}\n\nGenerate 3 new distinct sub‑branches that refine this idea."
-            res = await researcher.arun(prompt)
-            new_raw = res.content.strip()
-            new_branches = parse_branches(new_raw)
-            if len(new_branches) != 3:
-                new_branches = {"1": new_raw[:200], "2": new_raw[200:400], "3": new_raw[400:600]}
-            new_scored = await evaluate_branches(critic, query, new_branches)
-            for nb_id, (nb_content, nb_score) in new_scored.items():
-                if nb_score >= 6:
-                    next_candidates.append((f"{b_id}.{nb_id}", nb_content, nb_score))
-        next_candidates.sort(key=lambda x: x[2], reverse=True)
-        active = next_candidates[:beam_width]
-        history.append({
-            "iteration": it,
-            "candidates_evaluated": len(next_candidates),
-            "active": [{"id": b[0], "content": b[1], "score": b[2]} for b in active],
-        })
-
-    # Synthesize final answer
-    if active:
-        survivors_text = "\n\n".join([f"Branch {b[0]} (score {b[2]}): {b[1]}" for b in active])
-        synth_prompt = f"Original question: {query}\n\nThese are the best reasoning paths:\n{survivors_text}\n\nCombine them into a comprehensive, high‑density final answer."
-    else:
-        synth_prompt = f"Original question: {query}\n\nNo strong branches survived. Provide the best possible answer based on the initial exploration."
-
-    final_res = await researcher.arun(synth_prompt)
-    final_answer = final_res.content.strip()
-
-    # Save to persistent memory
-    save_tree_history(query, final_answer, history)
-
-    return BrainResponse(final_answer=final_answer, tree_history=history)
-
-def parse_branches(raw: str) -> Dict[str, str]:
-    branches = {}
-    current_label = None
-    for line in raw.split('\n'):
-        line = line.strip()
-        if line.startswith("1)") or line.startswith("1."):
-            current_label = "1"
-            branches[current_label] = line[2:].strip()
-        elif line.startswith("2)") or line.startswith("2."):
-            current_label = "2"
-            branches[current_label] = line[2:].strip()
-        elif line.startswith("3)") or line.startswith("3."):
-            current_label = "3"
-            branches[current_label] = line[2:].strip()
-        else:
-            if current_label and current_label in branches:
-                branches[current_label] += " " + line
-    return branches
-
-async def evaluate_branches(critic_agent, query: str, branches: Dict[str, str]) -> Dict[str, tuple]:
-    critic_input = f"Original question: {query}\nBranches:\n"
-    for label, text in branches.items():
-        critic_input += f"Branch {label}: {text[:300]}\n"
-    critic_input += "\nScore each branch from 1 to 10. Format: 'Branch X: score'"
-    critic_res = await critic_agent.arun(critic_input)
-    raw_scores = critic_res.content.strip()
-    scored = {}
-    for line in raw_scores.split('\n'):
-        line = line.strip()
-        if line.lower().startswith("branch"):
-            parts = line.split(':')
-            if len(parts) >= 2:
-                b_id = parts[0].replace("Branch", "").strip()
-                try:
-                    score = int(parts[1].strip())
-                except:
-                    score = 5
-                if b_id in branches:
-                    scored[b_id] = (branches[b_id], score)
-    for b_id in branches:
-        if b_id not in scored:
-            scored[b_id] = (branches[b_id], 5)
-    return scored
+planner = Agent(
+    model=Ollama(
+        id=RESEARCHER_MODEL,
+        host=OLLAMA_HOST,
+        options={"num_ctx": CONTEXT_SIZE, "num_gpu": 99},
+    ),
+    description="You are a planner. Break a high‑level goal into a JSON list of tasks.",
+    instructions=[
+        "Output ONLY a valid JSON array of task objects. Each task has:",
+        "  - 'id': integer",
+        "  - 'type': one of 'research', 'code', 'critique'",
+        "  - 'description': string",
+        "  - 'depends_on': list of task ids (or empty)",
+        "Example: [{'id':1, 'type':'research', 'description':'Find latest...', 'depends_on':[]}]",
+    ],
+    markdown=False,
+)
 
 # ------------------------------
 # FastAPI App
 # ------------------------------
-app = FastAPI(title="LocalAI Brain with Full Autonomy")
+app = FastAPI(title="LocalAI Autonomous Brain")
 
-@app.post("/brain", response_model=BrainResponse)
-async def brain_endpoint(query: BrainQuery):
-    try:
-        result = await run_tot_beam(query.query, query.max_iterations, query.beam_width)
-        return result
-    except Exception as e:
-        logging.exception("Brain error")
-        raise HTTPException(status_code=500, detail=str(e))
+class ProjectRequest(BaseModel):
+    goal: str
+    max_tasks: int = 5
+
+class ProjectResponse(BaseModel):
+    tasks_completed: List[Dict]
+    final_summary: str
 
 class IngestRequest(BaseModel):
     file_path: str
 
+@app.post("/run_project", response_model=ProjectResponse)
+async def run_project(req: ProjectRequest):
+    # 1. Planner
+    plan_raw = await planner.arun(f"Goal: {req.goal}")
+    import json
+    try:
+        tasks = json.loads(plan_raw.content.strip().replace("'", '"'))
+    except Exception:
+        tasks = [
+            {"id": 1, "type": "research", "description": f"Research about {req.goal}", "depends_on": []}
+        ]
+    if len(tasks) > req.max_tasks:
+        tasks = tasks[:req.max_tasks]
+
+    completed = []
+    final_context = ""
+    # 2. Execute tasks with manual tools
+    for task in tasks:
+        if task["type"] == "research":
+            # Manual web search
+            query = task['description']
+            search_results = web_search(query, max_results=3)
+            # Feed search results to researcher agent
+            prompt = f"Task: {query}\n\nSearch Results:\n{search_results}\n\nSynthesise a concise answer."
+            res = await researcher.arun(prompt)
+            answer = res.content.strip()
+            # Auto‑ingest the research result
+            try:
+                ingest_raw_text(f"Research result for '{query}':\n{answer}", source="web_research")
+                logging.info("Auto‑ingested research result")
+            except Exception as e:
+                logging.warning(f"Auto‑ingestion failed: {e}")
+            completed.append({"task_id": task["id"], "result": answer})
+            final_context += f"\n{answer}"
+
+        elif task["type"] == "code":
+            async with file_lock:
+                prompt = f"Task: {task['description']}\nWrite the Python code. Output ONLY the code and a short explanation."
+                res = await coder.arun(prompt)
+                answer = res.content.strip()
+                # Attempt to extract code block and write to file
+                code = answer
+                if "```" in answer:
+                    parts = answer.split("```")
+                    if len(parts) >= 2:
+                        code = parts[1].replace("python", "").strip()
+                # Generate filename from description
+                import re
+                filename = re.sub(r'[^\w\s]', '', task['description']).replace(' ', '_').lower() + ".py"
+                file_path = write_file(filename, code)
+                completed.append({"task_id": task["id"], "result": f"File written to {file_path}\nCode:\n{code}"})
+                final_context += f"\n{code}"
+
+        elif task["type"] == "critique":
+            prompt = f"Evaluate the following progress:\n{final_context}\nProvide a score (1-10) and justification."
+            res = await critic.arun(prompt)
+            completed.append({"task_id": task["id"], "result": res.content.strip()})
+
+    # 3. Final synthesis
+    synth = await researcher.arun(f"Summarize the whole project: {req.goal}\nContext:\n{final_context}")
+    save_tree_history(req.goal, synth.content.strip(), completed)
+    return ProjectResponse(tasks_completed=completed, final_summary=synth.content.strip())
+
 @app.post("/ingest")
 async def ingest_endpoint(req: IngestRequest):
-    try:
-        count = ingest_document(req.file_path)
-        return {"status": "success", "chunks_ingested": count}
-    except Exception as e:
-        logging.exception("Ingest error")
-        raise HTTPException(status_code=500, detail=str(e))
+    count = ingest_document(req.file_path)
+    return {"status": "success", "chunks_ingested": count}
 
 if __name__ == "__main__":
     import uvicorn
